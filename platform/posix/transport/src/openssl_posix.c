@@ -1,26 +1,3 @@
-/*
- * AWS IoT Device SDK for Embedded C 202211.00
- * Copyright (C) 2020 Amazon.com, Inc. or its affiliates.  All Rights Reserved.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
-
 /* Standard includes. */
 #include <assert.h>
 #include <string.h>
@@ -33,7 +10,15 @@
 #include "transport_interface.h"
 
 #include "openssl_posix.h"
+
+#include <openssl/ssl.h>
 #include <openssl/err.h>
+
+/* Openssl Provider includes*/
+#include <openssl/provider.h>
+#include <openssl/evp.h>
+#include <openssl/param_build.h>
+#include <openssl/core_names.h>
 
 /*-----------------------------------------------------------*/
 
@@ -52,6 +37,10 @@
  */
 #define CLIENT_KEY_LABEL     "client's key"
 
+#define PRIVATE_KEYSLOT "0xe0f1"
+
+#define TRUSTM_PROVIDER_PATH "/home/pi/optiga-trust-m-explorer-aws/Python_TrustM_GUI/linux-optiga-trust-m/bin/trustm_provider.so"
+
 /*-----------------------------------------------------------*/
 
 /* Each compilation unit must define the NetworkContext struct. */
@@ -61,6 +50,11 @@ struct NetworkContext
 };
 
 /*-----------------------------------------------------------*/
+// Function declarations
+static EVP_PKEY *load_private_key_from_hsm(const char *keyIdentifier);
+static EVP_PKEY *load_public_key_from_cert(const char *cert_path);
+static int compare_public_keys(EVP_PKEY *key1, EVP_PKEY *key2);
+static void print_openssl_errors(void);
 
 /**
  * @brief Log the absolute path given a relative or absolute path.
@@ -106,12 +100,12 @@ static int32_t setClientCertificate( SSL_CTX * pSslContext,
  * @brief Set private key for the client's certificate.
  *
  * @param[out] pSslContext SSL context to which the private key is to be added.
- * @param[in] pPrivateKeyPath Filepath string to the client private key.
+ * @param[in] pPrivateKey Private key to be used by the client.
  *
  * @return 1 on success; 0 on failure.
  */
 static int32_t setPrivateKey( SSL_CTX * pSslContext,
-                              const char * pPrivateKeyPath );
+                              EVP_PKEY * pPrivateKey );
 
 /**
  * @brief Passes TLS credentials to the OpenSSL library.
@@ -172,6 +166,20 @@ static OpensslStatus_t tlsHandshake( const ServerInfo_t * pServerInfo,
  * @return 1 on success; 0 on failure.
  */
 static int32_t isValidNetworkContext( const NetworkContext_t * pNetworkContext );
+/*-----------------------------------------------------------*/
+OSSL_PROVIDER *trustm_provider = NULL;
+
+static int initialize_trustm_provider(void) {
+    trustm_provider = OSSL_PROVIDER_load(NULL, TRUSTM_PROVIDER_PATH);
+    if (trustm_provider == NULL) {
+        LogError(("Failed to load TrustM provider\n"));
+        print_openssl_errors();
+        return 0;
+    }
+    LogDebug(("TrustM provider loaded successfully\n"));
+    return 1;
+}
+
 /*-----------------------------------------------------------*/
 
 #if ( LIBRARY_LOG_LEVEL == LOG_DEBUG )
@@ -246,10 +254,17 @@ static OpensslStatus_t tlsHandshake( const ServerInfo_t * pServerInfo,
     /* Validate the hostname against the server's certificate. */
     sslStatus = SSL_set1_host( pOpensslParams->pSsl, pServerInfo->pHostName );
 
-    if( sslStatus != 1 )
-    {
-        LogError( ( "SSL_set1_host failed to set the hostname to validate." ) );
-        returnStatus = OPENSSL_API_ERROR;
+    if (sslStatus != 1) {
+        LogError(("SSL_set1_host failed to set the hostname to validate.\n"));
+        return OPENSSL_API_ERROR;
+    }
+
+    /* Verify the server certificate */
+    verifyPeerCertStatus = ( int32_t ) SSL_get_verify_result( pOpensslParams->pSsl );
+
+    if (verifyPeerCertStatus != X509_V_OK) {
+        LogError(("SSL_get_verify_result failed to verify X509 certificate from peer.\n"));
+        return OPENSSL_HANDSHAKE_FAILED;
     }
 
     /* Enable SSL peer verification. */
@@ -380,7 +395,7 @@ static int32_t setRootCa( const SSL_CTX * pSslContext,
     /* Log the success message if we successfully imported the root CA. */
     if( sslStatus == 1 )
     {
-        LogDebug( ( "Successfully imported root CA." ) );
+        LogInfo( ( "Successfully imported root CA." ) );
     }
 
     return sslStatus;
@@ -398,6 +413,8 @@ static int32_t setClientCertificate( SSL_CTX * pSslContext,
     #if ( LIBRARY_LOG_LEVEL == LOG_DEBUG )
         logPath( pClientCertPath, CLIENT_CERT_LABEL );
     #endif
+
+    LogDebug(("Client certificate path: %s", pClientCertPath));
 
     /* Import the client certificate. */
     sslStatus = SSL_CTX_use_certificate_chain_file( pSslContext, pClientCertPath );
@@ -417,27 +434,20 @@ static int32_t setClientCertificate( SSL_CTX * pSslContext,
 }
 /*-----------------------------------------------------------*/
 
-static int32_t setPrivateKey( SSL_CTX * pSslContext,
-                              const char * pPrivateKeyPath )
+static int32_t setPrivateKey( SSL_CTX * pSslContext, EVP_PKEY * pPrivateKey )
 {
     int32_t sslStatus = -1;
 
     assert( pSslContext != NULL );
-    assert( pPrivateKeyPath != NULL );
-
-    #if ( LIBRARY_LOG_LEVEL == LOG_DEBUG )
-        logPath( pPrivateKeyPath, CLIENT_KEY_LABEL );
-    #endif
+    assert( pPrivateKey != NULL );
 
     /* Import the client certificate private key. */
-    sslStatus = SSL_CTX_use_PrivateKey_file( pSslContext, pPrivateKeyPath,
-                                             SSL_FILETYPE_PEM );
+    sslStatus = SSL_CTX_use_PrivateKey( pSslContext, pPrivateKey );
 
     if( sslStatus != 1 )
     {
-        LogError( ( "SSL_CTX_use_PrivateKey_file failed to import client "
-                    "certificate private key at %s.",
-                    pPrivateKeyPath ) );
+        LogError( ( "SSL_CTX_use_PrivateKey failed to import client "
+                    "certificate private key." ) );
     }
     else
     {
@@ -447,34 +457,68 @@ static int32_t setPrivateKey( SSL_CTX * pSslContext,
     return sslStatus;
 }
 /*-----------------------------------------------------------*/
-
-static int32_t setCredentials( SSL_CTX * pSslContext,
-                               const OpensslCredentials_t * pOpensslCredentials )
+static int32_t setCredentials(SSL_CTX *pSslContext, const OpensslCredentials_t *pOpensslCredentials)
 {
-    int32_t sslStatus = 0;
+    int32_t sslStatus = -1;
+    char error_buf[256]; // Buffer for error messages
 
-    assert( pSslContext != NULL );
-    assert( pOpensslCredentials != NULL );
+    assert(pSslContext != NULL);
+    assert(pOpensslCredentials != NULL);
 
-    if( pOpensslCredentials->pRootCaPath != NULL )
+    /* Set the client certificate first */
+    if (pOpensslCredentials->pClientCertPath != NULL)
     {
-        sslStatus = setRootCa( pSslContext, pOpensslCredentials->pRootCaPath );
+        LogDebug(("Client certificate path: %s", pOpensslCredentials->pClientCertPath));
+        sslStatus = SSL_CTX_use_certificate_file(pSslContext, pOpensslCredentials->pClientCertPath, SSL_FILETYPE_PEM);
+
+        if (sslStatus != 1)
+        {
+            print_openssl_errors();
+            LogError(("SSL_CTX_use_certificate_file failed to load client certificate."));
+            return sslStatus;
+        }
+    }
+    else
+    {
+        LogError(("Client certificate path is NULL."));
+        return -1;
     }
 
-    if( ( sslStatus == 1 ) && ( pOpensslCredentials->pClientCertPath != NULL ) )
+    /* Now set the private key */
+    if (pOpensslCredentials->pPrivateKey != NULL)
     {
-        sslStatus =
-            setClientCertificate( pSslContext, pOpensslCredentials->pClientCertPath );
+        sslStatus = SSL_CTX_use_PrivateKey(pSslContext, pOpensslCredentials->pPrivateKey);
+
+        if (sslStatus != 1)
+        {
+            print_openssl_errors();
+            LogError(("SSL_CTX_use_PrivateKey failed to import client certificate private key."));
+            return sslStatus;
+        }
+    }
+    else
+    {
+        LogError(("Private key is NULL."));
+        return -1;
     }
 
-    if( ( sslStatus == 1 ) && ( pOpensslCredentials->pPrivateKeyPath != NULL ) )
+    /* Verify the private key matches the certificate. */
+    sslStatus = SSL_CTX_check_private_key(pSslContext);
+
+    if (sslStatus != 1)
     {
-        sslStatus =
-            setPrivateKey( pSslContext, pOpensslCredentials->pPrivateKeyPath );
+        // Print OpenSSL error to get detailed information
+        unsigned long error_code = ERR_get_error();
+        ERR_error_string_n(error_code, error_buf, sizeof(error_buf));
+
+        LogError(("Private key/certificate mismatch. Details: %s", error_buf));
+
+        return sslStatus; // Return the error code immediately
     }
 
     return sslStatus;
 }
+
 /*-----------------------------------------------------------*/
 
 static void setOptionalConfigurations( SSL * pSsl,
@@ -565,11 +609,6 @@ static int32_t isValidNetworkContext( const NetworkContext_t * pNetworkContext )
     {
         LogError( ( "Parameter check failed: pNetworkContext is NULL." ) );
     }
-    else if( pNetworkContext->pParams->pSsl == NULL )
-    {
-        LogError( ( "Failed to receive data over network: "
-                    "SSL object in network context is NULL." ) );
-    }
     else
     {
         isValid = 1;
@@ -579,129 +618,207 @@ static int32_t isValidNetworkContext( const NetworkContext_t * pNetworkContext )
 }
 /*-----------------------------------------------------------*/
 
-OpensslStatus_t Openssl_Connect( NetworkContext_t * pNetworkContext,
-                                 const ServerInfo_t * pServerInfo,
-                                 const OpensslCredentials_t * pOpensslCredentials,
-                                 uint32_t sendTimeoutMs,
-                                 uint32_t recvTimeoutMs )
-{
-    OpensslParams_t * pOpensslParams = NULL;
-    SocketStatus_t socketStatus = SOCKETS_SUCCESS;
+/* Function to print OpenSSL errors */
+static void print_openssl_errors(void) {
+    unsigned long err_code;
+    while ((err_code = ERR_get_error()) != 0) {
+        char err_buf[256];
+        ERR_error_string_n(err_code, err_buf, sizeof(err_buf));
+        printf("OpenSSL error: %s\n", err_buf);
+    }
+}
+
+static EVP_PKEY *load_private_key_from_hsm(const char *keyIdentifier) {
+
+    pctx = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
+    if (pctx == NULL) {
+        LogError(("Failed to create EVP_PKEY_CTX with TrustM provider\n"));
+        print_openssl_errors();
+        return NULL;
+    }
+    
+    if (EVP_PKEY_fromdata_init(pctx) <= 0) {
+        LogError(("Failed to initialize EVP_PKEY context\n"));
+        print_openssl_errors();
+        EVP_PKEY_CTX_free(pctx);
+        return NULL;
+    }
+
+    OSSL_PARAM params[] = {
+        OSSL_PARAM_construct_utf8_string("key", (char *)keyIdentifier, 0),
+        OSSL_PARAM_construct_end()
+    };
+
+    if (EVP_PKEY_fromdata(pctx, &pkey, EVP_PKEY_KEYPAIR, params) <= 0) {
+        LogError(("Failed to load key from TrustM\n"));
+        print_openssl_errors();
+        EVP_PKEY_CTX_free(pctx);
+        return NULL;
+    }
+
+    EVP_PKEY_CTX_free(pctx);
+    return pkey;
+}
+
+static EVP_PKEY *load_public_key_from_cert(const char *cert_path) {
+    FILE *fp = fopen(cert_path, "r");
+    if (fp == NULL) {
+        perror("Unable to open certificate file");
+        return NULL;
+    }
+
+    X509 *cert = PEM_read_X509(fp, NULL, NULL, NULL);
+    fclose(fp);
+
+    if (cert == NULL) {
+        LogError(("Unable to parse certificate\n"));
+        return NULL;
+    }
+    
+    EVP_PKEY *pkey = X509_get_pubkey(cert);
+    X509_free(cert);
+
+    return pkey;
+}
+
+static int compare_public_keys(EVP_PKEY *key1, EVP_PKEY *key2) {
+    if (EVP_PKEY_cmp(key1, key2) == 1) {
+        return 1; // Keys match
+    } else {
+        return 0; // Keys do not match
+    }
+}
+
+OpensslStatus_t Openssl_Connect(NetworkContext_t *pNetworkContext,
+                                const ServerInfo_t *pServerInfo,
+                                const OpensslCredentials_t *pOpensslCredentials,
+                                uint32_t sendTimeoutMs,
+                                uint32_t recvTimeoutMs) {
+    SSL_CTX *pSslContext = NULL;
+    EVP_PKEY *pkey = NULL;
+    EVP_PKEY *cert_pubkey = NULL;
     OpensslStatus_t returnStatus = OPENSSL_SUCCESS;
-    int32_t sslStatus = 0;
-    uint8_t sslObjectCreated = 0;
-    SSL_CTX * pSslContext = NULL;
+    OpensslParams_t *pOpensslParams = NULL;
+    SocketStatus_t socketStatus = SOCKETS_INVALID_PARAMETER;
+    uint8_t sslObjectCreated = 0u;
 
-    /* Validate parameters. */
-    if( ( pNetworkContext == NULL ) || ( pNetworkContext->pParams == NULL ) )
-    {
-        LogError( ( "Parameter check failed: pNetworkContext is NULL." ) );
-        returnStatus = OPENSSL_INVALID_PARAMETER;
-    }
-    else if( pOpensslCredentials == NULL )
-    {
-        LogError( ( "Parameter check failed: pOpensslCredentials is NULL." ) );
-        returnStatus = OPENSSL_INVALID_PARAMETER;
-    }
-    else
-    {
-        /* Empty else. */
+    if (!initialize_trustm_provider()) {
+        LogError(("Failed to initialize TrustM provider\n"));
+        return OPENSSL_API_ERROR;
     }
 
-    /* Establish the TCP connection. */
-    if( returnStatus == OPENSSL_SUCCESS )
-    {
-        pOpensslParams = pNetworkContext->pParams;
-        socketStatus = Sockets_Connect( &pOpensslParams->socketDescriptor,
-                                        pServerInfo, sendTimeoutMs, recvTimeoutMs );
-
-        /* Convert socket wrapper status to openssl status. */
-        returnStatus = convertToOpensslStatus( socketStatus );
+    pkey = load_private_key_from_hsm(PRIVATE_KEYSLOT);
+    if (pkey == NULL) {
+        LogError(("Failed to load private key from TrustM\n"));
+        return OPENSSL_API_ERROR;
     }
 
-    /* Create SSL context. */
-    if( returnStatus == OPENSSL_SUCCESS )
-    {
-        pSslContext = SSL_CTX_new( TLS_client_method() );
+    LogDebug(("Client certificate path: %s", pOpensslCredentials->pClientCertPath));
+    cert_pubkey = load_public_key_from_cert(pOpensslCredentials->pClientCertPath);
+    if (cert_pubkey == NULL) {
+        LogError(("Failed to load public key from certificate\n"));
+        EVP_PKEY_free(pkey);
+        return OPENSSL_API_ERROR;
+    }
 
-        if( pSslContext == NULL )
-        {
-            LogError( ( "Creation of a new SSL_CTX object failed." ) );
-            returnStatus = OPENSSL_API_ERROR;
+    if (!compare_public_keys(cert_pubkey, pkey)) {
+        LogError(("Public key from certificate does not match private key from TrustM\n"));
+        EVP_PKEY_free(cert_pubkey);
+        EVP_PKEY_free(pkey);
+        return OPENSSL_API_ERROR;
+    }
+
+    // Create a new SSL context
+    pSslContext = SSL_CTX_new_ex(libctx, propq, TLS_client_method());
+    if (pSslContext == NULL) {
+        LogError(("Creation of a new SSL_CTX object failed.\n"));
+        ERR_print_errors_fp(stderr);
+        returnStatus = OPENSSL_API_ERROR;
+    }
+
+    pOpensslCredentials.pPrivateKey = pkey;
+
+    // Set the client certificate if provided
+     if (pOpensslCredentials.pClientCertPath != NULL) {
+        LogDebug(("Setting client certificate path: %s", pOpensslCredentials->pClientCertPath));
+        if (SSL_CTX_use_certificate_file(pSslContext, pOpensslCredentials->pClientCertPath, SSL_FILETYPE_PEM) != 1) {
+            print_openssl_errors();
+            LogError(("SSL_CTX_use_certificate_file failed to load client certificate.\n"));
+            return OPENSSL_API_ERROR;
         }
+    } else {
+        LogError(("Client certificate path is NULL.\n"));
+        return OPENSSL_API_ERROR;
     }
 
-    /* Setup credentials. */
-    if( returnStatus == OPENSSL_SUCCESS )
-    {
-        /* Enable partial writes for blocking calls to SSL_write to allow a
-         * payload larger than the maximum fragment length.
-         * The mask returned by SSL_CTX_set_mode does not need to be checked. */
+    if (SSL_CTX_use_PrivateKey(pSslContext, pkey) != 1) {
+        print_openssl_errors();
+        LogError(("Error setting private key to SSL context.\n"));
+        return OPENSSL_API_ERROR;
+    }
 
-        /* MISRA Directive 4.6 flags the following line for using basic
-        * numerical type long. This directive is suppressed because openssl
-        * function #SSL_CTX_set_mode takes an argument of type long. */
-        /* coverity[misra_c_2012_directive_4_6_violation] */
-        ( void ) SSL_CTX_set_mode( pSslContext, ( long ) SSL_MODE_ENABLE_PARTIAL_WRITE );
+    if (SSL_CTX_check_private_key(pSslContext) != 1) {
+        print_openssl_errors();
+        LogError(("Private key/certificate mismatch.\n"));
+        return OPENSSL_API_ERROR;
+    }
 
-        sslStatus = setCredentials( pSslContext, pOpensslCredentials );
+    if (returnStatus == OPENSSL_SUCCESS) {
+        pOpensslParams = pNetworkContext->pParams;
+        socketStatus = Sockets_Connect(&pOpensslParams->socketDescriptor,
+                                       pServerInfo, sendTimeoutMs, recvTimeoutMs);
+        returnStatus = convertToOpensslStatus(socketStatus);
+    }
 
-        if( sslStatus != 1 )
-        {
-            LogError( ( "Setting up credentials failed." ) );
+    if (returnStatus == OPENSSL_SUCCESS) {
+        if (setCredentials(pSslContext, &pOpensslCredentials) != 1) {
+            LogError(("Setting up credentials failed.\n"));
             returnStatus = OPENSSL_INVALID_CREDENTIALS;
         }
     }
 
-    /* Create a new SSL session. */
-    if( returnStatus == OPENSSL_SUCCESS )
-    {
-        pOpensslParams->pSsl = SSL_new( pSslContext );
-
-        if( pOpensslParams->pSsl == NULL )
-        {
-            LogError( ( "SSL_new failed to create a new SSL context." ) );
+    if (returnStatus == OPENSSL_SUCCESS) {
+        pOpensslParams->pSsl = SSL_new(pSslContext);
+        if (pOpensslParams->pSsl == NULL) {
+            LogError(("SSL_new failed to create a new SSL context.\n"));
             returnStatus = OPENSSL_API_ERROR;
-        }
-        else
-        {
+        } else {
             sslObjectCreated = 1u;
         }
     }
 
-    /* Setup the socket to use for communication. */
-    if( returnStatus == OPENSSL_SUCCESS )
-    {
-        returnStatus =
-            tlsHandshake( pServerInfo, pOpensslParams, pOpensslCredentials );
+    if (returnStatus == OPENSSL_SUCCESS) {
+        returnStatus = tlsHandshake(pServerInfo, pOpensslParams, &pOpensslCredentials);
     }
 
-    /* Free the SSL context. */
-    if( pSslContext != NULL )
-    {
-        SSL_CTX_free( pSslContext );
-        pSslContext = NULL;
+    if (pSslContext != NULL) {
+    SSL_CTX_free(pSslContext);
+    pSslContext = NULL;
+    }
+    
+    if (pkey != NULL) {
+        EVP_PKEY_free(pkey);
+    }
+    
+    if (cert_pubkey != NULL) {
+        EVP_PKEY_free(cert_pubkey);
     }
 
-    /* Clean up on error. */
-    if( ( returnStatus != OPENSSL_SUCCESS ) && ( sslObjectCreated == 1u ) )
-    {
-        SSL_free( pOpensslParams->pSsl );
+    if (returnStatus != OPENSSL_SUCCESS && sslObjectCreated == 1u) {
+        SSL_free(pOpensslParams->pSsl);
         pOpensslParams->pSsl = NULL;
     }
 
-    /* Log failure or success depending on status. */
-    if( returnStatus != OPENSSL_SUCCESS )
-    {
-        LogError( ( "Failed to establish a TLS connection." ) );
-    }
-    else
-    {
-        LogDebug( ( "Established a TLS connection." ) );
+    if (returnStatus != OPENSSL_SUCCESS) {
+        LogError(("Failed to establish a TLS connection."));
+    } else {
+        LogDebug(("Established a TLS connection."));
     }
 
     return returnStatus;
 }
+
+
 /*-----------------------------------------------------------*/
 
 OpensslStatus_t Openssl_Disconnect( const NetworkContext_t * pNetworkContext )
@@ -837,6 +954,11 @@ int32_t Openssl_Recv( NetworkContext_t * pNetworkContext,
                  * this function as zero to represent that no data was received from
                  * the network. */
                 bytesReceived = 0;
+            }
+            else if (sslError == SSL_ERROR_SYSCALL) {
+                LogError(("SSL_read failed with SSL_ERROR_SYSCALL\n"));
+                print_openssl_errors();
+                bytesReceived = -1;
             }
             else
             {

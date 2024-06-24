@@ -21,6 +21,7 @@
  */
 
 /*
+ * "mqtt_demo_mutual_auth"
  * Demo for showing the use of MQTT APIs to establish an MQTT session,
  * subscribe to a topic, publish to a topic, receive incoming publishes,
  * unsubscribe from a topic and disconnect the MQTT session.
@@ -78,6 +79,9 @@
 /* AWS IoT Core TLS ALPN definitions for MQTT authentication */
 #include "aws_iot_alpn_defs.h"
 
+/* Define PRIVATE_KEYSLOT */
+#define PRIVATE_KEYSLOT "0xe0f1"
+
 /**
  * These configuration settings are required to run the mutual auth demo.
  * Throw compilation error if the below configs are not defined.
@@ -98,11 +102,7 @@
     #ifndef CLIENT_CERT_PATH
         #error "Please define path to client certificate(CLIENT_CERT_PATH) in demo_config.h."
     #endif
-    #ifndef CLIENT_PRIVATE_KEY_PATH
-        #error "Please define path to client private key(CLIENT_PRIVATE_KEY_PATH) in demo_config.h."
-    #endif
 #else
-
 /* If a username is defined, a client password also would need to be defined for
  * client authentication. */
     #ifndef CLIENT_PASSWORD
@@ -175,7 +175,7 @@
  * The topic name starts with the client identifier to ensure that each demo
  * interacts with a unique topic name.
  */
-#define MQTT_EXAMPLE_TOPIC                       CLIENT_IDENTIFIER "/example/topic"
+#define MQTT_EXAMPLE_TOPIC                       CLIENT_IDENTIFIER
 
 /**
  * @brief Length of client MQTT topic.
@@ -185,7 +185,7 @@
 /**
  * @brief The MQTT message published in this example.
  */
-#define MQTT_EXAMPLE_MESSAGE                     "Hello World!"
+#define MQTT_EXAMPLE_MESSAGE                     MQTT_DEMO_MESSAGE
 
 /**
  * @brief The length of the MQTT message published in this example.
@@ -292,6 +292,9 @@
  */
 #define INCOMING_PUBLISH_RECORD_LEN    ( 10U )
 
+#define TRUSTM_PROVIDER_PATH "/home/pi/optiga-trust-m-explorer/Python_TrustM_GUI/linux-optiga-trust-m/bin/trustm_provider.so"
+#define OSSL_PKEY_PARAM_GROUP_NAME "group"
+
 /*-----------------------------------------------------------*/
 
 /**
@@ -310,6 +313,12 @@ typedef struct PublishPackets
      */
     MQTTPublishInfo_t pubInfo;
 } PublishPackets_t;
+
+// Define NetworkContext_t properly
+typedef struct NetworkContext
+{
+    OpensslParams_t * pParams;
+} NetworkContext_t;
 
 /*-----------------------------------------------------------*/
 
@@ -378,14 +387,7 @@ static MQTTPubAckInfo_t pIncomingPublishRecords[ INCOMING_PUBLISH_RECORD_LEN ];
 
 /*-----------------------------------------------------------*/
 
-/* Each compilation unit must define the NetworkContext struct. */
-struct NetworkContext
-{
-    OpensslParams_t * pParams;
-};
-
-/*-----------------------------------------------------------*/
-
+static void print_errors( void );
 /**
  * @brief The random number generator to use for exponential backoff with
  * jitter retry logic.
@@ -444,9 +446,7 @@ static void handleIncomingPublish( MQTTPublishInfo_t * pPublishInfo,
  * @param[in] pPacketInfo Packet Info pointer for the incoming packet.
  * @param[in] pDeserializedInfo Deserialized information from the incoming packet.
  */
-static void eventCallback( MQTTContext_t * pMqttContext,
-                           MQTTPacketInfo_t * pPacketInfo,
-                           MQTTDeserializedInfo_t * pDeserializedInfo );
+static void eventCallback( MQTTContext_t * pMqttContext, MQTTPacketInfo_t * pPacketInfo, MQTTDeserializedInfo_t * pDeserializedInfo );
 
 /**
  * @brief Initializes the MQTT library.
@@ -473,9 +473,7 @@ static int initializeMqtt( MQTTContext_t * pMqttContext,
  * @return EXIT_SUCCESS if an MQTT session is established;
  * EXIT_FAILURE otherwise.
  */
-static int establishMqttSession( MQTTContext_t * pMqttContext,
-                                 bool createCleanSession,
-                                 bool * pSessionPresent );
+static int establishMqttSession( MQTTContext_t * pMqttContext, NetworkContext_t * pNetworkContext, bool createCleanSession );
 
 /**
  * @brief Close an MQTT session by sending MQTT DISCONNECT.
@@ -593,9 +591,7 @@ static int handleResubscribe( MQTTContext_t * pMqttContext );
  *
  * @return true if the expected ACK packet was received, false otherwise.
  */
-static int waitForPacketAck( MQTTContext_t * pMqttContext,
-                             uint16_t usPacketIdentifier,
-                             uint32_t ulTimeout );
+static int waitForPacketAck( MQTTContext_t * pMqttContext, uint16_t usPacketIdentifier, uint32_t ulTimeout );
 
 /**
  * @brief Call #MQTT_ProcessLoop in a loop for the duration of a timeout or
@@ -608,141 +604,123 @@ static int waitForPacketAck( MQTTContext_t * pMqttContext,
  */
 static MQTTStatus_t processLoopWithTimeout( MQTTContext_t * pMqttContext,
                                             uint32_t ulTimeoutMs );
+static void print_errors(void);
 
+static void print_errors() {
+    unsigned long err_code;
+    while ((err_code = ERR_get_error()) != 0) {
+        char err_buf[256];
+        ERR_error_string_n(err_code, err_buf, sizeof(err_buf));
+        printf("OpenSSL error: %s\n", err_buf);
+    }
+}
 
+static int initialize_trustm_provider(void) {
+    OSSL_PROVIDER *trustm_provider = OSSL_PROVIDER_load(NULL, "trustm");
+    if (trustm_provider == NULL) {
+        fprintf(stderr, "Failed to load TrustM provider\n");
+        print_errors();
+        return 0;
+    }
+        printf("TrustM provider loaded successfully.\n");
+
+    // Verifying the private key slot accessibility
+    EVP_PKEY *pkey = EVP_PKEY_new();
+    if (!pkey) {
+        fprintf(stderr, "Failed to create new EVP_PKEY structure\n");
+        print_errors();
+        OSSL_PROVIDER_unload(trustm_provider);
+        return 0;
+    }
+
+    // This should match the way the private key is accessed in your OpenSSL setup.
+    pkey = EVP_PKEY_load_private_key(NULL, PRIVATE_KEYSLOT, NULL, NULL);
+    if (!pkey) {
+        fprintf(stderr, "Failed to load private key from slot %s\n", PRIVATE_KEYSLOT);
+        print_errors();
+        EVP_PKEY_free(pkey);
+        OSSL_PROVIDER_unload(trustm_provider);
+        return 0;
+    }
+
+    EVP_PKEY_free(pkey);
+    OSSL_PROVIDER_unload(trustm_provider);
+
+    printf("Private key slot %s is accessible.\n", PRIVATE_KEYSLOT);
+
+    return 1;
+}
 /*-----------------------------------------------------------*/
-
 static uint32_t generateRandomNumber()
 {
     return( rand() );
 }
 
 /*-----------------------------------------------------------*/
-
-static int connectToServerWithBackoffRetries( NetworkContext_t * pNetworkContext,
-                                              MQTTContext_t * pMqttContext,
-                                              bool * pClientSessionPresent,
-                                              bool * pBrokerSessionPresent )
-{
+static int connectToServerWithBackoffRetries(NetworkContext_t *pNetworkContext, MQTTContext_t *pMqttContext,
+                                             bool *pClientSessionPresent, bool *pBrokerSessionPresent) {
     int returnStatus = EXIT_FAILURE;
     BackoffAlgorithmStatus_t backoffAlgStatus = BackoffAlgorithmSuccess;
-    OpensslStatus_t opensslStatus = OPENSSL_SUCCESS;
     BackoffAlgorithmContext_t reconnectParams;
     ServerInfo_t serverInfo;
-    OpensslCredentials_t opensslCredentials;
     uint16_t nextRetryBackOff;
     bool createCleanSession;
+    OpensslCredentials_t opensslCredentials;
 
-    /* Initialize information to connect to the MQTT broker. */
+    // Initialize information to connect to the MQTT broker
     serverInfo.pHostName = AWS_IOT_ENDPOINT;
-    serverInfo.hostNameLength = AWS_IOT_ENDPOINT_LENGTH;
-    serverInfo.port = AWS_MQTT_PORT;
+    serverInfo.hostNameLength = strlen(AWS_IOT_ENDPOINT);
+    serverInfo.port = 8883;
 
-    /* Initialize credentials for establishing TLS session. */
-    memset( &opensslCredentials, 0, sizeof( OpensslCredentials_t ) );
+    // Initialize credentials for establishing TLS session
+    memset(&opensslCredentials, 0, sizeof(OpensslCredentials_t));
     opensslCredentials.pRootCaPath = ROOT_CA_CERT_PATH;
+    opensslCredentials.pClientCertPath = CLIENT_CERT_PATH;
 
-    /* If #CLIENT_USERNAME is defined, username/password is used for authenticating
-     * the client. */
-    #ifndef CLIENT_USERNAME
-        opensslCredentials.pClientCertPath = CLIENT_CERT_PATH;
-        opensslCredentials.pPrivateKeyPath = CLIENT_PRIVATE_KEY_PATH;
-    #endif
-
-    /* AWS IoT requires devices to send the Server Name Indication (SNI)
-     * extension to the Transport Layer Security (TLS) protocol and provide
-     * the complete endpoint address in the host_name field. Details about
-     * SNI for AWS IoT can be found in the link below.
-     * https://docs.aws.amazon.com/iot/latest/developerguide/transport-security.html */
+    // AWS IoT requires devices to send the Server Name Indication (SNI) extension to the TLS protocol
     opensslCredentials.sniHostName = AWS_IOT_ENDPOINT;
 
-    if( AWS_MQTT_PORT == 443 )
-    {
-        /* Pass the ALPN protocol name depending on the port and auth type being used.
-         * Please see more details about the ALPN protocol for the AWS IoT MQTT
-         * endpoint in the link below.
-         * https://aws.amazon.com/blogs/iot/mqtt-with-tls-client-authentication-on-port-443-why-it-is-useful-and-how-it-works/
-         *
-         * For username and password based authentication in AWS IoT,
-         * #AWS_IOT_ALPN_MQTT_CUSTOM_AUTH is used. More details can be found in the
-         * link below.
-         * https://docs.aws.amazon.com/iot/latest/developerguide/custom-authentication.html
-         */
-        #ifdef CLIENT_USERNAME
-            opensslCredentials.pAlpnProtos = AWS_IOT_ALPN_MQTT_CUSTOM_AUTH_OPENSSL;
-            opensslCredentials.alpnProtosLen = AWS_IOT_ALPN_MQTT_CUSTOM_AUTH_OPENSSL_LEN;
-        #else
-            opensslCredentials.pAlpnProtos = AWS_IOT_ALPN_MQTT_CA_AUTH_OPENSSL;
-            opensslCredentials.alpnProtosLen = AWS_IOT_ALPN_MQTT_CA_AUTH_OPENSSL_LEN;
-        #endif
-    }
+    // Initialize reconnect attempts and interval
+    BackoffAlgorithm_InitializeParams(&reconnectParams, 500U, 5000U, 5U);
 
-    /* Initialize reconnect attempts and interval */
-    BackoffAlgorithm_InitializeParams( &reconnectParams,
-                                       CONNECTION_RETRY_BACKOFF_BASE_MS,
-                                       CONNECTION_RETRY_MAX_BACKOFF_DELAY_MS,
-                                       CONNECTION_RETRY_MAX_ATTEMPTS );
+    do {
+        printf("Establishing a TLS session to %.*s:%d.\n", serverInfo.hostNameLength, serverInfo.pHostName, serverInfo.port);
+        OpensslStatus_t opensslStatus = Openssl_Connect(pNetworkContext, &serverInfo, &opensslCredentials, 500U, 500U);
 
-    /* Attempt to connect to MQTT broker. If connection fails, retry after
-     * a timeout. Timeout value will exponentially increase until maximum
-     * attempts are reached.
-     */
-    do
-    {
-        /* Establish a TLS session with the MQTT broker. This example connects
-         * to the MQTT broker as specified in AWS_IOT_ENDPOINT and AWS_MQTT_PORT
-         * at the demo config header. */
-        LogInfo( ( "Establishing a TLS session to %.*s:%d.",
-                   AWS_IOT_ENDPOINT_LENGTH,
-                   AWS_IOT_ENDPOINT,
-                   AWS_MQTT_PORT ) );
-        opensslStatus = Openssl_Connect( pNetworkContext,
-                                         &serverInfo,
-                                         &opensslCredentials,
-                                         TRANSPORT_SEND_RECV_TIMEOUT_MS,
-                                         TRANSPORT_SEND_RECV_TIMEOUT_MS );
+        if (opensslStatus == OPENSSL_SUCCESS) {
+            createCleanSession = (*pClientSessionPresent == true) ? false : true;
+            returnStatus = establishMqttSession(pMqttContext, pNetworkContext, createCleanSession);
 
-        if( opensslStatus == OPENSSL_SUCCESS )
-        {
-            /* A clean MQTT session needs to be created, if there is no session saved
-             * in this MQTT client. */
-            createCleanSession = ( *pClientSessionPresent == true ) ? false : true;
-
-            /* Sends an MQTT Connect packet using the established TLS session,
-             * then waits for connection acknowledgment (CONNACK) packet. */
-            returnStatus = establishMqttSession( pMqttContext, createCleanSession, pBrokerSessionPresent );
-
-            if( returnStatus == EXIT_FAILURE )
-            {
-                /* End TLS session, then close TCP connection. */
-                ( void ) Openssl_Disconnect( pNetworkContext );
+            if (returnStatus == EXIT_FAILURE) {
+                if (Openssl_Disconnect(pNetworkContext) != OPENSSL_SUCCESS) {
+                    printf("Openssl_Disconnect failed.\n");
+                    print_errors();
+                }
             }
+        } else {
+            printf("Openssl_Connect failed with status: %d\n", opensslStatus);
+            print_errors();
         }
 
-        if( returnStatus == EXIT_FAILURE )
-        {
-            /* Generate a random number and get back-off value (in milliseconds) for the next connection retry. */
-            backoffAlgStatus = BackoffAlgorithm_GetNextBackoff( &reconnectParams, generateRandomNumber(), &nextRetryBackOff );
+        if (returnStatus == EXIT_FAILURE) {
+            backoffAlgStatus = BackoffAlgorithm_GetNextBackoff(&reconnectParams, generateRandomNumber(), &nextRetryBackOff);
 
-            if( backoffAlgStatus == BackoffAlgorithmRetriesExhausted )
-            {
-                LogError( ( "Connection to the broker failed, all attempts exhausted." ) );
+            if (backoffAlgStatus == BackoffAlgorithmRetriesExhausted) {
+                printf("Connection to the broker failed, all attempts exhausted.\n");
+                print_errors();
                 returnStatus = EXIT_FAILURE;
-            }
-            else if( backoffAlgStatus == BackoffAlgorithmSuccess )
-            {
-                LogWarn( ( "Connection to the broker failed. Retrying connection "
-                           "after %hu ms backoff.",
-                           ( unsigned short ) nextRetryBackOff ) );
-                Clock_SleepMs( nextRetryBackOff );
+            } else if (backoffAlgStatus == BackoffAlgorithmSuccess) {
+                printf("Connection to the broker failed. Retrying connection after %hu ms backoff.\n", (unsigned short)nextRetryBackOff);
+                Clock_SleepMs(nextRetryBackOff);
             }
         }
-    } while( ( returnStatus == EXIT_FAILURE ) && ( backoffAlgStatus == BackoffAlgorithmSuccess ) );
+    } while ((returnStatus == EXIT_FAILURE) && (backoffAlgStatus == BackoffAlgorithmSuccess));
 
     return returnStatus;
 }
 
 /*-----------------------------------------------------------*/
+
 
 static int getNextFreeIndexForOutgoingPublishes( uint8_t * pIndex )
 {
@@ -983,9 +961,8 @@ static int handleResubscribe( MQTTContext_t * pMqttContext )
                    MQTT_EXAMPLE_TOPIC ) );
 
         /* Process incoming packet. */
-        returnStatus = waitForPacketAck( pMqttContext,
-                                         globalSubscribePacketIdentifier,
-                                         MQTT_PROCESS_LOOP_TIMEOUT_MS );
+        returnStatus = waitForPacketAck(pMqttContext, globalSubscribePacketIdentifier, MQTT_PROCESS_LOOP_TIMEOUT_MS);
+
 
         if( returnStatus == EXIT_FAILURE )
         {
@@ -1115,59 +1092,26 @@ static void eventCallback( MQTTContext_t * pMqttContext,
 
 /*-----------------------------------------------------------*/
 
-static int establishMqttSession( MQTTContext_t * pMqttContext,
-                                 bool createCleanSession,
-                                 bool * pSessionPresent )
+static int establishMqttSession( MQTTContext_t * pMqttContext, NetworkContext_t * pNetworkContext, bool createCleanSession )
 {
     int returnStatus = EXIT_SUCCESS;
     MQTTStatus_t mqttStatus;
     MQTTConnectInfo_t connectInfo = { 0 };
+    bool sessionPresent = false;
 
     #ifdef CLIENT_USERNAME
         void * pMemchrPtr;
     #endif
 
     assert( pMqttContext != NULL );
-    assert( pSessionPresent != NULL );
+    assert( pNetworkContext != NULL );
 
     /* Establish MQTT session by sending a CONNECT packet. */
-
-    /* If #createCleanSession is true, start with a clean session
-     * i.e. direct the MQTT broker to discard any previous session data.
-     * If #createCleanSession is false, directs the broker to attempt to
-     * reestablish a session which was already present. */
     connectInfo.cleanSession = createCleanSession;
-
-    /* The client identifier is used to uniquely identify this MQTT client to
-     * the MQTT broker. In a production device the identifier can be something
-     * unique, such as a device serial number. */
     connectInfo.pClientIdentifier = CLIENT_IDENTIFIER;
     connectInfo.clientIdentifierLength = CLIENT_IDENTIFIER_LENGTH;
-
-    /* The maximum time interval in seconds which is allowed to elapse
-     * between two Control Packets.
-     * It is the responsibility of the Client to ensure that the interval between
-     * Control Packets being sent does not exceed the this Keep Alive value. In the
-     * absence of sending any other Control Packets, the Client MUST send a
-     * PINGREQ Packet. */
     connectInfo.keepAliveSeconds = MQTT_KEEP_ALIVE_INTERVAL_SECONDS;
 
-    /* Use the username and password for authentication, if they are defined.
-     * Refer to the AWS IoT documentation below for details regarding client
-     * authentication with a username and password.
-     * https://docs.aws.amazon.com/iot/latest/developerguide/custom-authentication.html
-     * An authorizer setup needs to be done, as mentioned in the above link, to use
-     * username/password based client authentication.
-     *
-     * The username field is populated with voluntary metrics to AWS IoT.
-     * The metrics collected by AWS IoT are the operating system, the operating
-     * system's version, the hardware platform, and the MQTT Client library
-     * information. These metrics help AWS IoT improve security and provide
-     * better technical support.
-     *
-     * If client authentication is based on username/password in AWS IoT,
-     * the metrics string is appended to the username to support both client
-     * authentication and metrics collection. */
     #ifdef CLIENT_USERNAME
         pMemchrPtr = memchr( CLIENT_USERNAME, '?', strlen( CLIENT_USERNAME ) );
 
@@ -1184,16 +1128,14 @@ static int establishMqttSession( MQTTContext_t * pMqttContext,
 
         connectInfo.pPassword = CLIENT_PASSWORD;
         connectInfo.passwordLength = strlen( CLIENT_PASSWORD );
-    #else /* ifdef CLIENT_USERNAME */
+    #else
         connectInfo.pUserName = METRICS_STRING;
         connectInfo.userNameLength = METRICS_STRING_LENGTH;
-        /* Password for authentication is not used. */
         connectInfo.pPassword = NULL;
         connectInfo.passwordLength = 0U;
-    #endif /* ifdef CLIENT_USERNAME */
+    #endif
 
-    /* Send MQTT CONNECT packet to broker. */
-    mqttStatus = MQTT_Connect( pMqttContext, &connectInfo, NULL, CONNACK_RECV_TIMEOUT_MS, pSessionPresent );
+    mqttStatus = MQTT_Connect( pMqttContext, &connectInfo, NULL, CONNACK_RECV_TIMEOUT_MS, &sessionPresent );
 
     if( mqttStatus != MQTTSuccess )
     {
@@ -1555,12 +1497,9 @@ static int subscribePublishLoop( MQTTContext_t * pMqttContext )
 
     return returnStatus;
 }
-
 /*-----------------------------------------------------------*/
 
-static int waitForPacketAck( MQTTContext_t * pMqttContext,
-                             uint16_t usPacketIdentifier,
-                             uint32_t ulTimeout )
+static int waitForPacketAck( MQTTContext_t * pMqttContext, uint16_t usPacketIdentifier, uint32_t ulTimeout )
 {
     uint32_t ulMqttProcessLoopEntryTime;
     uint32_t ulMqttProcessLoopTimeoutTime;
@@ -1576,14 +1515,10 @@ static int waitForPacketAck( MQTTContext_t * pMqttContext,
     ulMqttProcessLoopEntryTime = ulCurrentTime;
     ulMqttProcessLoopTimeoutTime = ulCurrentTime + ulTimeout;
 
-    /* Call MQTT_ProcessLoop multiple times until the expected packet ACK
-     * is received, a timeout happens, or MQTT_ProcessLoop fails. */
     while( ( globalAckPacketIdentifier != usPacketIdentifier ) &&
            ( ulCurrentTime < ulMqttProcessLoopTimeoutTime ) &&
            ( eMqttStatus == MQTTSuccess || eMqttStatus == MQTTNeedMoreBytes ) )
     {
-        /* Event callback will set #globalAckPacketIdentifier when receiving
-         * appropriate packet. */
         eMqttStatus = MQTT_ProcessLoop( pMqttContext );
         ulCurrentTime = pMqttContext->getTime();
     }
@@ -1645,100 +1580,47 @@ static MQTTStatus_t processLoopWithTimeout( MQTTContext_t * pMqttContext,
  * are resent in this demo. In order to support retransmission all the outgoing
  * publishes are stored until a PUBACK is received.
  */
-int main( int argc,
-          char ** argv )
-{
-    int returnStatus = EXIT_SUCCESS;
+
+int main() {
+    
+    if (!initialize_trustm_provider()) {
+        fprintf(stderr, "Failed to initialize TrustM provider\n");
+        return EXIT_FAILURE;
+    }
+    
+    OpensslParams_t opensslParams;
+    NetworkContext_t networkContext = { .pParams = &opensslParams };
     MQTTContext_t mqttContext = { 0 };
-    NetworkContext_t networkContext = { 0 };
-    OpensslParams_t opensslParams = { 0 };
-    bool clientSessionPresent = false, brokerSessionPresent = false;
-    struct timespec tp;
+    bool clientSessionPresent = false;
+    bool brokerSessionPresent = false;
+    int returnStatus = EXIT_SUCCESS;
 
-    ( void ) argc;
-    ( void ) argv;
+    srand(time(NULL));
 
-    /* Set the pParams member of the network context with desired transport. */
-    networkContext.pParams = &opensslParams;
+    OpenSSL_add_all_algorithms();
+    SSL_load_error_strings();
+    OPENSSL_init_crypto(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
 
-    /* Seed pseudo random number generator (provided by ISO C standard library) for
-     * use by retry utils library when retrying failed network operations. */
-
-    /* Get current time to seed pseudo random number generator. */
-    ( void ) clock_gettime( CLOCK_REALTIME, &tp );
-    /* Seed pseudo random number generator with nanoseconds. */
-    srand( tp.tv_nsec );
-
-    /* Initialize MQTT library. Initialization of the MQTT library needs to be
-     * done only once in this demo. */
-    returnStatus = initializeMqtt( &mqttContext, &networkContext );
-
-    if( returnStatus == EXIT_SUCCESS )
-    {
-        for( ; ; )
-        {
-            /* Attempt to connect to the MQTT broker. If connection fails, retry after
-             * a timeout. Timeout value will be exponentially increased till the maximum
-             * attempts are reached or maximum timeout value is reached. The function
-             * returns EXIT_FAILURE if the TCP connection cannot be established to
-             * broker after configured number of attempts. */
-            returnStatus = connectToServerWithBackoffRetries( &networkContext, &mqttContext, &clientSessionPresent, &brokerSessionPresent );
-
-            if( returnStatus == EXIT_FAILURE )
-            {
-                /* Log error to indicate connection failure after all
-                 * reconnect attempts are over. */
-                LogError( ( "Failed to connect to MQTT broker %.*s.",
-                            AWS_IOT_ENDPOINT_LENGTH,
-                            AWS_IOT_ENDPOINT ) );
-            }
-            else
-            {
-                /* Update the flag to indicate that an MQTT client session is saved.
-                 * Once this flag is set, MQTT connect in the following iterations of
-                 * this demo will be attempted without requesting for a clean session. */
-                clientSessionPresent = true;
-
-                /* Check if session is present and if there are any outgoing publishes
-                 * that need to resend. This is only valid if the broker is
-                 * re-establishing a session which was already present. */
-                if( brokerSessionPresent == true )
-                {
-                    LogInfo( ( "An MQTT session with broker is re-established. "
-                               "Resending unacked publishes." ) );
-
-                    /* Handle all the resend of publish messages. */
-                    returnStatus = handlePublishResend( &mqttContext );
-                }
-                else
-                {
-                    LogInfo( ( "A clean MQTT connection is established."
-                               " Cleaning up all the stored outgoing publishes.\n\n" ) );
-
-                    /* Clean up the outgoing publishes waiting for ack as this new
-                     * connection doesn't re-establish an existing session. */
-                    cleanupOutgoingPublishes();
-                }
-
-                /* If TLS session is established, execute Subscribe/Publish loop. */
-                returnStatus = subscribePublishLoop( &mqttContext );
-
-                /* End TLS session, then close TCP connection. */
-                ( void ) Openssl_Disconnect( &networkContext );
-            }
-
-            if( returnStatus == EXIT_SUCCESS )
-            {
-                /* Log message indicating an iteration completed successfully. */
-                LogInfo( ( "Demo completed successfully." ) );
-            }
-
-            LogInfo( ( "Short delay before starting the next iteration....\n" ) );
-            sleep( MQTT_SUBPUB_LOOP_DELAY_SECONDS );
-        }
+    // Initialize MQTT library
+    if (initializeMqtt(&mqttContext, &networkContext) != EXIT_SUCCESS) {
+        printf("Failed to initialize MQTT library.\n");
+        returnStatus = EXIT_FAILURE;
+        goto cleanup;
     }
 
+    // Connect to the server with backoff retries
+    if (connectToServerWithBackoffRetries(&networkContext, &mqttContext, &clientSessionPresent, &brokerSessionPresent) != EXIT_SUCCESS) {
+        printf("Failed to connect to server with backoff retries.\n");
+        returnStatus = EXIT_FAILURE;
+        goto cleanup;
+    }
+
+    // Proceed with MQTT operations such as subscribing and publishing
+    if (subscribePublishLoop(&mqttContext) != EXIT_SUCCESS) {
+        printf("Failed to run subscribe-publish loop.\n");
+        returnStatus = EXIT_FAILURE;
+    }
+
+cleanup:
     return returnStatus;
 }
-
-/*-----------------------------------------------------------*/

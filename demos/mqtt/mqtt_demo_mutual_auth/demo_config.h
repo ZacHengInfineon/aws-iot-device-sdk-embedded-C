@@ -54,9 +54,10 @@
  *
  * @note Your AWS IoT Core endpoint can be found in the AWS IoT console under
  * Settings/Custom Endpoint, or using the describe-endpoint API.
- *
- * #define AWS_IOT_ENDPOINT               "...insert here..."
  */
+
+#define AWS_IOT_ENDPOINT     "a2kfkheds2p7dx-ats.iot.us-west-2.amazonaws.com"
+
 
 /**
  * @brief AWS IoT MQTT broker port number.
@@ -86,7 +87,7 @@
  * ROOT_CA_CERT_PATH to the absolute path if this demo is executed from elsewhere.
  */
 #ifndef ROOT_CA_CERT_PATH
-    #define ROOT_CA_CERT_PATH    "certificates/AmazonRootCA1.crt"
+    #define ROOT_CA_CERT_PATH    "certificates/AmazonRootCA1.pem"
 #endif
 
 /**
@@ -97,9 +98,9 @@
  * https://docs.aws.amazon.com/iot/latest/developerguide/client-authentication.html
  *
  * @note This certificate should be PEM-encoded.
- *
- * #define CLIENT_CERT_PATH    "...insert here..."
  */
+#define CLIENT_CERT_PATH    "../../../working_space/leafAWS.crt"
+
 
 /**
  * @brief Path of the file containing the client's private key.
@@ -108,10 +109,10 @@
  * authentication.
  * https://docs.aws.amazon.com/iot/latest/developerguide/client-authentication.html
  *
- * @note This private key should be PEM-encoded.
- *
- * #define CLIENT_PRIVATE_KEY_PATH    "...insert here..."
+ //~ * @note This private key should be PEM-encoded.
  */
+#define CLIENT_PRIVATE_KEY_PATH    "0xf0e1"
+
 
 /**
  * @brief The username value for authenticating client to MQTT broker when
@@ -152,9 +153,11 @@
  *
  * No two clients may use the same client identifier simultaneously.
  */
-#ifndef CLIENT_IDENTIFIER
-    #define CLIENT_IDENTIFIER    "testclient"
-#endif
+
+#define CLIENT_IDENTIFIER    "pulsioximeter"
+
+#define MQTT_DEMO_MESSAGE   "SPO2: 96, BPM: 60"
+
 
 /**
  * @brief Size of the network buffer for MQTT packets.
